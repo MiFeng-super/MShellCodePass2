@@ -4,7 +4,7 @@
 
 struct GlobalVariableInfo
 {
-    StructType* type;
+    StructType* type = nullptr;
     DenseMap<llvm::GlobalVariable*, unsigned> field_index;
 };
 
@@ -15,11 +15,23 @@ public:
 
     static bool isRequired() { return true; }
 
+private:
+    void reset_state();
+
+public:
+
     void collect_entry_function(Module& M);
     void collect_chain_function(Function* func);
     void check_function_escaped(Function* func);
+    Function* get_direct_callee(CallBase* call);
+    bool is_supported_function_use(
+        Function* func,
+        Use& use,
+        SmallPtrSetImpl<User*>& visited
+    );
     bool is_allowed_metadata_use(User* user);
     void report_function_escape(Function* func, User* user);
+    void report_unsupported_call(CallBase* call);
     void report_unsupported_global_variable(GlobalVariable* gv);
     void collect_global_variables();
     bool is_valid_global_variable(GlobalVariable* gv);
@@ -32,6 +44,8 @@ public:
     void replace_global_variable_accesses();
     void replace_declare_call();
     void replace_store_vector();
+    void prune_unreachable_functions(Module& module);
+    std::string validate_api_resolver(Module& module);
 
     Value* get_global_variable_ctx_ptr(Function* func, GlobalVariable* gv, Instruction* insert_before);
     Value* get_declare_call_ctx_ptr(Function* func, std::string name, Instruction* insert_before);
@@ -43,7 +57,7 @@ public:
 
     Function* add_function_parameter(Function* func, Type* type);
 
-    uint64_t gvr_djb2(const char *s);
+    uint64_t gvr_djb2(StringRef name);
     
 
 public:
@@ -59,4 +73,5 @@ public:
     DenseMap<Function*, AllocaInst*> _global_variable_info_alloc;
     DenseMap<Function*, Function*> _chain_with_ctx_functions;
     DenseMap<Function*, Value*> _function_ctx_ptr;
+    Function* _api_resolver = nullptr;
 };

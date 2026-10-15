@@ -2,12 +2,161 @@
 #include "shellcode.h"
 #include "ConstantToStackEmitter.h"
 
+namespace
+{
+class FunctionReferenceIndex
+{
+public:
+    explicit FunctionReferenceIndex(
+        const SmallPtrSetImpl<Function*>& unreachable_functions
+    )
+        : _unreachable_functions(unreachable_functions)
+    {
+    }
+
+    bool contains_unreachable(Value* root)
+    {
+        SmallPtrSet<Value*, 32> visiting;
+        return contains_unreachable(root, visiting);
+    }
+
+    bool has_live_use(Value* value)
+    {
+        SmallPtrSet<User*, 32> visiting;
+        return has_live_use(value, visiting);
+    }
+
+    void clear_live_use_cache()
+    {
+        _live_use_cache.clear();
+    }
+
+private:
+    bool contains_unreachable(
+        Value* value,
+        SmallPtrSetImpl<Value*>& visiting
+    )
+    {
+        if (value == nullptr)
+        {
+            return false;
+        }
+
+        auto cache_it = _unreachable_cache.find(value);
+        if (cache_it != _unreachable_cache.end())
+        {
+            return cache_it->second;
+        }
+
+        if (!visiting.insert(value).second)
+        {
+            return false;
+        }
+
+        bool result = false;
+        if (auto* function = dyn_cast<Function>(
+            value->stripPointerCastsAndAliases()
+        ))
+        {
+            result = _unreachable_functions.contains(function);
+        }
+        else if (auto* constant = dyn_cast<Constant>(value))
+        {
+            for (Value* operand : constant->operands())
+            {
+                if (contains_unreachable(operand, visiting))
+                {
+                    result = true;
+                    break;
+                }
+            }
+        }
+
+        visiting.erase(value);
+        _unreachable_cache[value] = result;
+        return result;
+    }
+
+    bool has_live_use(
+        Value* value,
+        SmallPtrSetImpl<User*>& visiting
+    )
+    {
+        if (value == nullptr)
+        {
+            return false;
+        }
+
+        for (User* user : value->users())
+        {
+            if (is_live_user(user, visiting))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool is_live_user(
+        User* user,
+        SmallPtrSetImpl<User*>& visiting
+    )
+    {
+        if (isa<Instruction>(user) ||
+            isa<GlobalVariable>(user) ||
+            isa<GlobalAlias>(user) ||
+            isa<Function>(user))
+        {
+            return true;
+        }
+
+        auto cache_it = _live_use_cache.find(user);
+        if (cache_it != _live_use_cache.end())
+        {
+            return cache_it->second;
+        }
+
+        auto* constant = dyn_cast<Constant>(user);
+        if (constant == nullptr || !visiting.insert(user).second)
+        {
+            return false;
+        }
+
+        bool result = false;
+        for (User* parent : constant->users())
+        {
+            if (is_live_user(parent, visiting))
+            {
+                result = true;
+                break;
+            }
+        }
+
+        visiting.erase(user);
+        _live_use_cache[user] = result;
+        return result;
+    }
+
+    const SmallPtrSetImpl<Function*>& _unreachable_functions;
+    DenseMap<Value*, bool> _unreachable_cache;
+    DenseMap<User*, bool> _live_use_cache;
+};
+}
+
 PreservedAnalyses ToShellCodePass::run(Module& M, ModuleAnalysisManager& MAM)
 {
+    reset_state();
+
     LOG("Running on module: {}", M.getName().str());
 
     // Collect entry functions
     collect_entry_function(M);
+
+    if (_entry_functions.empty())
+    {
+        return PreservedAnalyses::all();
+    }
     
     // Collect chain functions
     for (auto* func : _entry_functions)
@@ -27,6 +176,11 @@ PreservedAnalyses ToShellCodePass::run(Module& M, ModuleAnalysisManager& MAM)
     for (auto& [name, func_type] : _declare_call_functions)
     {
         LOG("Found declare call function: {}", name.str());
+    }
+
+    if (auto error = validate_api_resolver(M); !error.empty())
+    {
+        report_fatal_error(StringRef(error));
     }
 
 
@@ -71,30 +225,9 @@ PreservedAnalyses ToShellCodePass::run(Module& M, ModuleAnalysisManager& MAM)
     // Replace store vector
     replace_store_vector();
 
-    for (auto* func : _chain_with_ctx_functions.keys()) 
-    {
-        func->eraseFromParent();
-    }
+    prune_unreachable_functions(M);
 
-    for (auto& func : llvm::make_early_inc_range(M.getFunctionList())) 
-    {
-        if (func.isIntrinsic()) 
-        {
-            continue;
-        }
-
-        if (func.isDeclaration()) 
-        {
-            continue;
-        }
-
-        if (func.use_empty() && !func.getName().contains("main")) 
-        {
-            func.eraseFromParent();
-        }
-    }
-
-    for (auto* gv : _global_variables) 
+    for (auto* gv : _global_variables)
     {
         gv->eraseFromParent();
     }
@@ -106,6 +239,248 @@ PreservedAnalyses ToShellCodePass::run(Module& M, ModuleAnalysisManager& MAM)
     }
 
     return PreservedAnalyses::none();
+}
+
+void ToShellCodePass::reset_state()
+{
+    _entry_functions.clear();
+    _chain_functions.clear();
+    _declare_call_functions.clear();
+    _declare_call_functions_index.clear();
+    _global_variables.clear();
+    _global_variable_info.type = nullptr;
+    _global_variable_info.field_index.clear();
+    _global_variable_info_alloc.clear();
+    _chain_with_ctx_functions.clear();
+    _function_ctx_ptr.clear();
+    _api_resolver = nullptr;
+}
+
+void ToShellCodePass::prune_unreachable_functions(Module& module)
+{
+    SmallSetVector<Function*, 32> reachable_functions;
+    SmallVector<Function*, 32> worklist(
+        _entry_functions.begin(),
+        _entry_functions.end()
+    );
+
+    while (!worklist.empty())
+    {
+        Function* function = worklist.pop_back_val();
+
+        if (function == nullptr || !reachable_functions.insert(function))
+        {
+            continue;
+        }
+
+        for (auto& block : *function)
+        {
+            for (auto& instruction : block)
+            {
+                auto* call = dyn_cast<CallBase>(&instruction);
+                if (call == nullptr)
+                {
+                    continue;
+                }
+
+                Function* callee = get_direct_callee(call);
+                if (callee != nullptr)
+                {
+                    worklist.push_back(callee);
+                }
+            }
+        }
+
+        if (function->hasPersonalityFn())
+        {
+            auto* personality = dyn_cast<Function>(
+                function->getPersonalityFn()->stripPointerCastsAndAliases()
+            );
+            if (personality != nullptr)
+            {
+                worklist.push_back(personality);
+            }
+        }
+    }
+
+    SmallVector<Function*, 32> unreachable_functions;
+    SmallPtrSet<Function*, 32> unreachable_function_set;
+
+    for (auto& function : module)
+    {
+        if (!reachable_functions.contains(&function))
+        {
+            unreachable_functions.push_back(&function);
+            unreachable_function_set.insert(&function);
+        }
+    }
+
+    auto is_special_global = [](StringRef name)
+    {
+        return name == "llvm.global.ctors" ||
+            name == "llvm.global.dtors" ||
+            name == "llvm.used" ||
+            name == "llvm.compiler.used" ||
+            name == "llvm.global.annotations";
+    };
+
+    FunctionReferenceIndex references(unreachable_function_set);
+
+    SmallVector<GlobalVariable*, 8> special_globals;
+    for (auto& global : module.globals())
+    {
+        if (is_special_global(global.getName()))
+        {
+            special_globals.push_back(&global);
+        }
+    }
+
+    for (auto* global : special_globals)
+    {
+        auto* array = dyn_cast<ConstantArray>(global->getInitializer());
+        if (array == nullptr)
+        {
+            continue;
+        }
+
+        SmallVector<Constant*, 32> retained;
+        retained.reserve(array->getNumOperands());
+        bool changed = false;
+
+        for (Value* operand : array->operands())
+        {
+            auto* element = cast<Constant>(operand);
+            if (references.contains_unreachable(element))
+            {
+                changed = true;
+                continue;
+            }
+
+            retained.push_back(element);
+        }
+
+        if (!changed)
+        {
+            continue;
+        }
+
+        auto* new_array_type = ArrayType::get(
+            array->getType()->getElementType(),
+            retained.size()
+        );
+        auto* new_initializer = ConstantArray::get(new_array_type, retained);
+        auto* replacement = new GlobalVariable(
+            module,
+            new_array_type,
+            global->isConstant(),
+            global->getLinkage(),
+            new_initializer,
+            "",
+            global,
+            global->getThreadLocalMode(),
+            global->getAddressSpace(),
+            global->isExternallyInitialized()
+        );
+        replacement->copyAttributesFrom(global);
+        replacement->takeName(global);
+        global->replaceAllUsesWith(replacement);
+        global->eraseFromParent();
+    }
+
+    for (auto* function : unreachable_functions)
+    {
+        function->dropAllReferences();
+    }
+
+    bool erased_alias = false;
+    do
+    {
+        erased_alias = false;
+        SmallVector<GlobalAlias*, 8> dead_aliases;
+
+        for (auto& alias : module.aliases())
+        {
+            auto* aliasee = dyn_cast<Function>(
+                alias.getAliasee()->stripPointerCastsAndAliases()
+            );
+
+            if (aliasee != nullptr &&
+                unreachable_function_set.contains(aliasee) &&
+                !references.has_live_use(&alias))
+            {
+                dead_aliases.push_back(&alias);
+            }
+        }
+
+        for (auto* alias : dead_aliases)
+        {
+            alias->eraseFromParent();
+            erased_alias = true;
+        }
+
+        if (erased_alias)
+        {
+            references.clear_live_use_cache();
+        }
+    } while (erased_alias);
+
+    for (auto& alias : module.aliases())
+    {
+        auto* aliasee = dyn_cast<Function>(
+            alias.getAliasee()->stripPointerCastsAndAliases()
+        );
+
+        if (aliasee == nullptr || !unreachable_function_set.contains(aliasee))
+        {
+            continue;
+        }
+
+        if (!references.has_live_use(&alias))
+        {
+            continue;
+        }
+
+        std::string message;
+        raw_string_ostream stream(message);
+        stream << "Unreachable function still has an alias reference\n";
+        stream << "Function: " << aliasee->getName() << "\n";
+        stream << "Alias: ";
+        alias.print(stream);
+        stream << "\n";
+        report_fatal_error(stream.str().c_str());
+    }
+
+    for (auto* function : unreachable_functions)
+    {
+        if (references.has_live_use(function))
+        {
+            std::string message;
+            raw_string_ostream stream(message);
+            stream << "Unreachable function still has a reference\n";
+            stream << "Function: " << function->getName() << "\n";
+            stream << "Use: ";
+            for (User* user : function->users())
+            {
+                if (isa<Instruction>(user) ||
+                    isa<GlobalVariable>(user) ||
+                    isa<GlobalAlias>(user) ||
+                    isa<Function>(user))
+                {
+                    user->print(stream);
+                    break;
+                }
+            }
+            stream << "\n";
+            report_fatal_error(stream.str().c_str());
+        }
+
+        if (!function->use_empty())
+        {
+            function->replaceAllUsesWith(UndefValue::get(function->getType()));
+        }
+
+        function->eraseFromParent();
+    }
 }
 
 
@@ -173,25 +548,28 @@ void ToShellCodePass::collect_chain_function(Function* func)
         return;
     }
 
+    _chain_functions.insert(func);
+
     check_function_escaped(func);
 
     for (auto& BB : *func)
     {
         for (auto& inst : BB) 
         {
-            if (auto* call = dyn_cast<CallInst>(&inst)) 
+            if (auto* call = dyn_cast<CallBase>(&inst))
             {
-                // 直接调用
-                if (Function* callee = call->getCalledFunction()) 
+                if (isa<CallBrInst>(call))
+                {
+                    report_unsupported_call(call);
+                }
+
+                if (Function* callee = get_direct_callee(call))
                 {
                     collect_chain_function(callee);
-                    continue;
                 }
             }
         }
     }
-
-    _chain_functions.insert(func);
 }
 
 void ToShellCodePass::check_function_escaped(Function* func)
@@ -201,25 +579,79 @@ void ToShellCodePass::check_function_escaped(Function* func)
         return;
     }
 
-    for (Use& use : func->uses()) 
+    SmallPtrSet<User*, 16> visited;
+
+    for (Use& use : func->uses())
     {
-        User* user = use.getUser();
-
-        if (auto* call = dyn_cast<CallInst>(user)) 
-        {
-            if (call->getCalledFunction() == func) 
-            {
-                continue;
-            }
-        }
-
-        if (is_allowed_metadata_use(user))
+        if (is_supported_function_use(func, use, visited))
         {
             continue;
         }
 
-        report_function_escape(func, user);
+        report_function_escape(func, use.getUser());
     }
+}
+
+Function* ToShellCodePass::get_direct_callee(CallBase* call)
+{
+    if (call == nullptr || call->isInlineAsm())
+    {
+        return nullptr;
+    }
+
+    return dyn_cast<Function>(
+        call->getCalledOperand()->stripPointerCastsAndAliases()
+    );
+}
+
+bool ToShellCodePass::is_supported_function_use(
+    Function* func,
+    Use& use,
+    SmallPtrSetImpl<User*>& visited
+)
+{
+    User* user = use.getUser();
+
+    if (auto* call = dyn_cast<CallBase>(user))
+    {
+        if (!call->isCallee(&use) || get_direct_callee(call) != func)
+        {
+            return false;
+        }
+
+        if (isa<CallBrInst>(call))
+        {
+            report_unsupported_call(call);
+        }
+
+        return true;
+    }
+
+    if (is_allowed_metadata_use(user))
+    {
+        return true;
+    }
+
+    auto* value = dyn_cast<Value>(user);
+    if (value == nullptr || value->stripPointerCastsAndAliases() != func)
+    {
+        return false;
+    }
+
+    if (!visited.insert(user).second)
+    {
+        return true;
+    }
+
+    for (Use& nested_use : user->uses())
+    {
+        if (!is_supported_function_use(func, nested_use, visited))
+        {
+            return false;
+        }
+    }
+
+    return true;
 
 }
 
@@ -229,7 +661,11 @@ bool ToShellCodePass::is_allowed_metadata_use(User* user)
     {
         StringRef name = gv->getName();
 
-        if (name == "llvm.global.annotations" || name == "llvm.used")
+        if (name == "llvm.global.annotations" ||
+            name == "llvm.global.ctors" ||
+            name == "llvm.global.dtors" ||
+            name == "llvm.used" ||
+            name == "llvm.compiler.used")
         {
             return true;
         }
@@ -271,6 +707,19 @@ void ToShellCodePass::report_function_escape(Function* func, User* user)
     }
 
     report_fatal_error(OS.str().c_str());
+}
+
+void ToShellCodePass::report_unsupported_call(CallBase* call)
+{
+    std::string message;
+    raw_string_ostream stream(message);
+
+    stream << "Unsupported call instruction detected\n";
+    stream << "Instruction: ";
+    call->print(stream);
+    stream << "\n";
+
+    report_fatal_error(stream.str().c_str());
 }
 
 void ToShellCodePass::report_unsupported_global_variable(GlobalVariable* gv)
@@ -451,11 +900,7 @@ void ToShellCodePass::add_declare_call_ctx_initializer(Function* func)
         return;
     }
 
-    auto* resolve_api = func->getParent()->getFunction("?resolve_api@@YA_K_K@Z");
-    if (resolve_api == nullptr)
-    {
-        return;
-    }
+    auto* resolve_api = _api_resolver;
 
     auto* alloc = it->second;
     IRBuilder<> builder(alloc->getNextNode());
@@ -463,7 +908,18 @@ void ToShellCodePass::add_declare_call_ctx_initializer(Function* func)
     for (auto& [name, func_type] : _declare_call_functions) 
     {
         auto field_index = _declare_call_functions_index[name];
-        Value* func_ptr = builder.CreateCall(resolve_api, { builder.getInt64(gvr_djb2(name.data())) });
+        auto* resolver_type = resolve_api->getFunctionType();
+        auto* hash_type = cast<IntegerType>(resolver_type->getParamType(0));
+        Value* hash = builder.getIntN(
+            hash_type->getBitWidth(),
+            gvr_djb2(name)
+        );
+        Value* resolved_address = builder.CreateCall(resolve_api, {hash});
+        Value* func_ptr = builder.CreateIntToPtr(
+            resolved_address,
+            PointerType::get(func_type, 0),
+            name + ".resolved"
+        );
         Value* ctx_ptr = builder.CreateStructGEP(
             _global_variable_info.type, 
             alloc, 
@@ -472,6 +928,73 @@ void ToShellCodePass::add_declare_call_ctx_initializer(Function* func)
         );
         builder.CreateStore(func_ptr, ctx_ptr);
     }
+}
+
+std::string ToShellCodePass::validate_api_resolver(Module& module)
+{
+    _api_resolver = nullptr;
+
+    if (_declare_call_functions.empty())
+    {
+        return {};
+    }
+
+    constexpr StringLiteral resolver_name("?resolve_api@@YA_K_K@Z");
+    const unsigned pointer_bits = module.getDataLayout().getPointerSizeInBits(0);
+    if (pointer_bits == 0)
+    {
+        return (Twine("external declaration calls require resolver ") +
+            resolver_name + ": target DataLayout has no pointer width").str();
+    }
+
+    const std::string expected_signature =
+        (Twine("i") + Twine(pointer_bits) + " (i" +
+         Twine(pointer_bits) + ")").str();
+
+    auto* resolver = module.getFunction(resolver_name);
+    if (resolver == nullptr)
+    {
+        return (Twine("missing required resolver ") + resolver_name +
+            "; expected signature " + expected_signature).str();
+    }
+
+    std::string actual_signature;
+    raw_string_ostream actual_stream(actual_signature);
+    resolver->getFunctionType()->print(actual_stream);
+    actual_stream.flush();
+
+    auto fail = [&](StringRef reason)
+    {
+        return (Twine("invalid resolver ") + resolver_name +
+            "; expected signature " + expected_signature +
+            "; actual signature " + actual_signature +
+            "; reason: " + reason).str();
+    };
+
+    auto* resolver_type = resolver->getFunctionType();
+    if (resolver->isDeclaration())
+    {
+        return fail("resolver must have a function body");
+    }
+    if (resolver_type->isVarArg())
+    {
+        return fail("resolver must not be variadic");
+    }
+    if (resolver_type->getNumParams() != 1)
+    {
+        return fail("resolver must take exactly one integer parameter");
+    }
+    if (!resolver_type->getParamType(0)->isIntegerTy(pointer_bits))
+    {
+        return fail("resolver parameter width must match the target pointer width");
+    }
+    if (!resolver_type->getReturnType()->isIntegerTy(pointer_bits))
+    {
+        return fail("resolver return width must match the target pointer width");
+    }
+
+    _api_resolver = resolver;
+    return {};
 }
 
 
@@ -500,6 +1023,14 @@ Function* ToShellCodePass::add_function_parameter(Function* func, Type* type)
         func->getParent()
     );
 
+    new_func->copyAttributesFrom(func);
+    new_func->setCallingConv(func->getCallingConv());
+
+    if (func->hasPersonalityFn())
+    {
+        new_func->setPersonalityFn(func->getPersonalityFn());
+    }
+
     ValueToValueMapTy value_map;
     auto new_arg_it = new_func->arg_begin();
     for (auto& arg : func->args())
@@ -522,7 +1053,7 @@ Function* ToShellCodePass::add_function_parameter(Function* func, Type* type)
 
 void ToShellCodePass::remap_call_sites()
 {
-    SmallVector<CallInst*, 64> calls;
+    SmallVector<CallBase*, 64> calls;
 
     SmallVector<Function*, 64> funcs;
 
@@ -540,9 +1071,14 @@ void ToShellCodePass::remap_call_sites()
         {
             for (auto& inst : BB) 
             {
-                if (auto* call = dyn_cast<CallInst>(&inst)) 
+                if (auto* call = dyn_cast<CallBase>(&inst))
                 {
-                    Function* callee = call->getCalledFunction();
+                    if (isa<CallBrInst>(call))
+                    {
+                        report_unsupported_call(call);
+                    }
+
+                    Function* callee = get_direct_callee(call);
                     if (callee == nullptr) 
                     {
                         continue;
@@ -567,7 +1103,7 @@ void ToShellCodePass::remap_call_sites()
         }
 
         Function* caller = old_call->getFunction();
-        Function* old_callee = old_call->getCalledFunction();
+        Function* old_callee = get_direct_callee(old_call);
 
         if (caller == nullptr || old_callee == nullptr)
         {
@@ -590,19 +1126,44 @@ void ToShellCodePass::remap_call_sites()
         SmallVector<Value*, 16> args(old_call->arg_begin(), old_call->arg_end());
         args.push_back(ctx);
 
-        IRBuilder<> builder(old_call);
-        CallInst* new_call = builder.CreateCall(
-            new_callee,
-            args
-        );
+        SmallVector<OperandBundleDef, 4> operand_bundles;
+        old_call->getOperandBundlesAsDefs(operand_bundles);
 
-        if (old_call->hasName())
+        IRBuilder<> builder(old_call);
+        CallBase* new_call = nullptr;
+
+        if (auto* old_invoke = dyn_cast<InvokeInst>(old_call))
         {
-            new_call->setName(old_call->getName());
+            new_call = builder.CreateInvoke(
+                new_callee->getFunctionType(),
+                new_callee,
+                old_invoke->getNormalDest(),
+                old_invoke->getUnwindDest(),
+                args,
+                operand_bundles
+            );
+        }
+        else if (auto* old_plain_call = dyn_cast<CallInst>(old_call))
+        {
+            auto* new_plain_call = builder.CreateCall(
+                new_callee->getFunctionType(),
+                new_callee,
+                args,
+                operand_bundles
+            );
+            new_plain_call->setTailCallKind(old_plain_call->getTailCallKind());
+            new_call = new_plain_call;
+        }
+        else
+        {
+            report_unsupported_call(old_call);
         }
 
         new_call->setCallingConv(old_call->getCallingConv());
-        new_call->setTailCallKind(old_call->getTailCallKind());
+        new_call->setAttributes(old_call->getAttributes());
+        new_call->setDebugLoc(old_call->getDebugLoc());
+        new_call->copyMetadata(*old_call);
+        new_call->takeName(old_call);
 
         if (!old_call->getType()->isVoidTy())
         {
@@ -673,9 +1234,14 @@ void ToShellCodePass::replace_declare_call()
         {
             for (auto& inst : BB) 
             {
-                if (auto* call = dyn_cast<CallInst>(&inst)) 
+                if (auto* call = dyn_cast<CallBase>(&inst))
                 {
-                    Function* callee = call->getCalledFunction();
+                    if (isa<CallBrInst>(call))
+                    {
+                        report_unsupported_call(call);
+                    }
+
+                    Function* callee = get_direct_callee(call);
 
                     if (callee == nullptr) 
                     {
@@ -873,9 +1439,14 @@ void ToShellCodePass::collect_declare_call()
         {
             for (auto& inst : BB) 
             {
-                if (auto* call = dyn_cast<CallInst>(&inst)) 
+                if (auto* call = dyn_cast<CallBase>(&inst))
                 {
-                    Function* callee = call->getCalledFunction();
+                    if (isa<CallBrInst>(call))
+                    {
+                        report_unsupported_call(call);
+                    }
+
+                    Function* callee = get_direct_callee(call);
 
                     if (callee == nullptr) 
                     {
@@ -899,9 +1470,12 @@ void ToShellCodePass::collect_declare_call()
     }
 }
 
-uint64_t ToShellCodePass::gvr_djb2(const char *s)
+uint64_t ToShellCodePass::gvr_djb2(StringRef name)
 {
     uint64_t h = 5381;
-    while (*s) h = ((h << 5) + h) + (unsigned char)(*s++);
+    for (unsigned char c : name.bytes())
+    {
+        h = ((h << 5) + h) + c;
+    }
     return h;
 }

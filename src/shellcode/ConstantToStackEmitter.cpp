@@ -93,9 +93,14 @@ bool ConstantToStackEmitter::emit_zero(Type* type, Value* dst)
 
 bool ConstantToStackEmitter::emit_zero_bytes(Value* dst, size_t size)
 {
-    if (dst == nullptr || size == 0) 
+    if (dst == nullptr)
     {
         return false;
+    }
+
+    if (size == 0)
+    {
+        return true;
     }
 
     size_t offset = 0; 
@@ -120,23 +125,44 @@ bool ConstantToStackEmitter::emit_data_sequential(ConstantDataSequential* consta
         return false;
     }
 
-    size_t size = constant->getNumElements();
+    const size_t element_count = constant->getNumElements();
+    const size_t element_size = constant->getElementByteSize();
+    const size_t size = element_count * element_size;
 
     SmallVector<uint8_t, 64> buffer;
-
     buffer.reserve(size);
 
-    for (size_t i = 0; i < size; i++)
+    Type* element_type = constant->getElementType();
+
+    for (size_t i = 0; i < element_count; i++)
     {
-        auto element = constant->getElementAsConstant(i);
-        auto ci = dyn_cast<ConstantInt>(element);
-        
-        if (ci == nullptr) 
+        APInt bits(1, 0);
+
+        if (element_type->isIntegerTy())
+        {
+            bits = constant->getElementAsAPInt(i);
+        }
+        else if (element_type->isFloatingPointTy())
+        {
+            bits = constant->getElementAsAPFloat(i).bitcastToAPInt();
+        }
+        else
         {
             return false;
         }
 
-        buffer.push_back(static_cast<uint8_t>(ci->getZExtValue()));
+        if (bits.getBitWidth() != element_size * 8)
+        {
+            return false;
+        }
+
+        for (size_t byte_index = 0; byte_index < element_size; byte_index++)
+        {
+            const size_t bit_offset = _layout.isLittleEndian()
+                ? byte_index * 8
+                : (element_size - byte_index - 1) * 8;
+            buffer.push_back(static_cast<uint8_t>(bits.extractBitsAsZExtValue(8, bit_offset)));
+        }
     }
 
     size_t offset = 0;
@@ -159,16 +185,26 @@ bool ConstantToStackEmitter::emit_data_sequential(ConstantDataSequential* consta
 
 bool ConstantToStackEmitter::emit_store_int_form_buffer(Value* dst, size_t offset, ArrayRef<uint8_t> bytes, size_t width)
 {
-    if (dst == nullptr || bytes.empty() || width == 0) 
+    if (dst == nullptr || bytes.empty() || width == 0 || offset + width > bytes.size())
     {
         return false;
     }
 
     uint64_t value = 0;
 
-    for (size_t i = 0; i < width; i++) 
+    if (_layout.isLittleEndian())
     {
-        value |= static_cast<uint64_t>(bytes[offset + i]) << (i * 8);
+        for (size_t i = 0; i < width; i++)
+        {
+            value |= static_cast<uint64_t>(bytes[offset + i]) << (i * 8);
+        }
+    }
+    else
+    {
+        for (size_t i = 0; i < width; i++)
+        {
+            value = (value << 8) | bytes[offset + i];
+        }
     }
     
     return emit_store_int(dst, offset, value, width);
@@ -197,7 +233,7 @@ bool ConstantToStackEmitter::emit_store_int(Value* dst, size_t offset, uint64_t 
     }
 
     auto store = _builder.CreateStore(c, ptr);
-    store->setAlignment(Align(width));
+    store->setAlignment(Align(1));
     return true;
 }
 

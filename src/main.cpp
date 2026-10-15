@@ -18,6 +18,15 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
                 
                 return false;
             });
+
+            PB.registerOptimizerLastEPCallback([](
+                ModulePassManager& MPM,
+                OptimizationLevel,
+                ThinOrFullLTOPhase
+            )
+            {
+                MPM.addPass(ToShellCodePass());
+            });
         }
     };
 }

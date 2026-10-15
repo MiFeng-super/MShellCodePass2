@@ -16,25 +16,28 @@ set_languages("cxx23", "c99")
 add_rules("mode.debug", "mode.release", "mode.releasedbg")
 add_rules("plugin.compile_commands.autoupdate", {outputdir = ".vscode"})
 
-local llvm_root = "D:/Reverse/llvm-project/Windows"
+local llvm_root = "D:/Reverse/llvm-project/Windows-MT"
+local llvm_tools_root = "D:/Reverse/llvm-project/Windows"
 
 target("MShellCodePass2")
     set_kind("shared")
+    set_policy("build.fence", true)
     set_pcxxheader("src/pch.h")
     add_files("src/**.cpp")
     add_files("src/exports.def")
     add_includedirs("src")
     add_headerfiles("src/**.h")
 
-    set_runtimes("MD")
+    set_runtimes("MT")
 
     add_headerfiles(path.join(llvm_root, "include/**.h"))
     add_includedirs(path.join(llvm_root, "include"))
     add_linkdirs(path.join(llvm_root, "lib"))
 
     add_cxxflags("/wd4624")
+    add_shflags("/include:malloc", {force = true})
 
-    add_syslinks("ntdll")
+    add_syslinks("psapi", "shell32", "ole32", "uuid", "advapi32", "ws2_32", "ntdll")
 
     add_links(
         "LLVMCore",
@@ -53,7 +56,6 @@ target("MShellCodePass2")
         "LLVMProfileData"
     )
 
-
 target("test")
     set_kind("phony")
     add_deps("MShellCodePass2")
@@ -63,7 +65,7 @@ target("test")
     local target_cpp = "test/test.cpp"
     local target_before_ll = build_target_dir .. "/before.ll"
     local target_after_ll = build_target_dir .. "/after.ll"
-    local target_exe = build_target_dir .. "/test.exe"
+    local target_dll = build_target_dir .. "/test.dll"
     local target_obj = build_target_dir .. "/test.obj"
     local target_bin = build_target_dir .. "/test.bin"
 
@@ -71,7 +73,7 @@ target("test")
 
         os.mkdir(build_target_dir)
 
-        local clang = llvm_root .. "/bin/clang++.exe"
+        local clang = llvm_tools_root .. "/bin/clang++.exe"
         local opt = llvm_root .. "/bin/opt.exe"
 
         print("Generating LLVM IR...")
@@ -80,19 +82,20 @@ target("test")
 
     on_run(function (target) 
         local opt = llvm_root .. "/bin/opt.exe"
-        local clang = llvm_root .. "/bin/clang++.exe"
-        local llc = llvm_root .. "/bin/llc.exe"
-        local link = llvm_root .. "/bin/ld.exe"
+        local clang = llvm_tools_root .. "/bin/clang++.exe"
         local pass_so = target:dep("MShellCodePass2"):targetfile()
 
         print("Run LLVM Pass...")
         os.execv(opt, {"-S", "-load-pass-plugin", pass_so, "-passes=" .. passes, target_before_ll, "-o", target_after_ll})
 
+        print("Verifying transformed LLVM IR...")
+        os.execv(opt, {"-passes=verify", "-disable-output", target_after_ll})
+
         print("Compiling...")
-        os.execv(clang, {target_after_ll, "-O3", "-o", target_exe, "-g", "-gcodeview", "-l", "user32"})
+        os.execv(clang, {target_after_ll, "-shared", "-O3", "-o", target_dll, "-g", "-gcodeview"})
 
         print("Extracting shellcode...")
-        os.execv("python", {"utils/extract_shellcode.py", target_exe, target_bin})
+        os.execv("python", {"utils/extract_shellcode.py", target_dll, target_bin})
     end)
 
     on_clean(function(target)
@@ -143,8 +146,73 @@ target("test")
     end)
 
 target("example")
-    set_kind("binary")
+    set_kind("phony")
     add_deps("MShellCodePass2")
-    add_files("example/**.cpp")
+    set_toolchains("clang-cl", {vs = "2026", vs_toolset = "14.51"})
+    set_runtimes("MD")
+    set_policy("build.ccache", false)
 
-    set_toolchains("clang-cl")
+    local example_build_dir = "build/example"
+    local example_module = example_build_dir .. "/module.ll"
+    local example_after_ll = example_build_dir .. "/after.ll"
+    local example_bin = example_build_dir .. "/example.exe"
+
+    on_load(function(target)
+        import("detect.sdks.find_vstudio")
+
+        local installations = find_vstudio({toolset = "14.51"}) or {}
+        local vs = assert(installations["2026"], "Visual Studio 18 (2026) is required for example")
+        assert(target:is_arch("x64"), "example requires x64 to match the pass plugin")
+        local vcvars = assert(vs.vcvarsall.x64, "Visual Studio 18 x64 build tools are required")
+        local clang_cl = path.join(vcvars.VCInstallDir, "Tools/Llvm/x64/bin/clang-cl.exe")
+        assert(os.isfile(clang_cl), "Install the Visual Studio 18 C++ Clang tools: " .. clang_cl)
+
+        target:set("toolset", "cc", "clang_cl@" .. clang_cl)
+        target:set("toolset", "cxx", "clang_cl@" .. clang_cl)
+        target:data_set("example.clang_cl", clang_cl)
+    end)
+
+    on_config(function(target)
+        local clang_cl = target:data("example.clang_cl")
+        local clang_version = os.iorunv(clang_cl, {"--version"}):match("clang version ([%d.]+)")
+        local llvm_version = os.iorunv(path.join(llvm_root, "bin/llvm-config.exe"), {"--version"}):trim()
+        assert(clang_version == llvm_version,
+            "LLVM version mismatch: VS clang-cl is " .. tostring(clang_version) .. ", pass SDK is " .. llvm_version)
+    end)
+
+    on_build(function(target)
+        os.mkdir(example_build_dir)
+
+        local clang_cl = target:data("example.clang_cl")
+        local llvm_link = path.join(llvm_tools_root, "bin/llvm-link.exe")
+        local opt = path.join(llvm_root, "bin/opt.exe")
+        local pass_dll = path.absolute(target:dep("MShellCodePass2"):targetfile())
+        local ir_files = {}
+
+        for index, source in ipairs(os.files("example/**.cpp")) do
+            local ir = path.join(example_build_dir, "input_" .. index .. ".ll")
+            print("Generating LLVM IR: " .. source)
+            os.execv(clang_cl, {"/O2", "/clang:-S", "/clang:-emit-llvm", "/clang:-o" .. ir, source})
+            table.insert(ir_files, ir)
+        end
+
+        print("Linking LLVM modules...")
+        local link_args = {"-S"}
+        for _, ir in ipairs(ir_files) do
+            table.insert(link_args, ir)
+        end
+        table.insert(link_args, "-o")
+        table.insert(link_args, example_module)
+        os.execv(llvm_link, link_args)
+
+        print("Running LLVM pass on unified module...")
+        os.execv(opt, {"-S", "-load-pass-plugin", pass_dll, "-passes=to-shellcode", example_module, "-o", example_after_ll})
+        os.execv(opt, {"-passes=verify", "-disable-output", example_after_ll})
+
+        print("Linking example executable...")
+        os.execv(clang_cl, {example_after_ll, "/Fe:" .. path.absolute(example_bin)})
+    end)
+
+    on_run(function()
+        os.execv(path.absolute(example_bin), {})
+    end)
