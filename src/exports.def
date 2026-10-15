@@ -1,0 +1,3 @@
+LIBRARY MShellCodePass2
+EXPORTS
+    llvmGetPassPluginInfo

@@ -1,0 +1,31 @@
+{
+    "clangd.arguments": [
+        "--compile-commands-dir=.vscode",
+        "--clang-tidy",
+        "-j=2",
+        "--pch-storage=disk",
+        "--header-insertion=never",
+        "--background-index",
+        "--all-scopes-completion",
+        "--completion-style=bundled",
+        "--function-arg-placeholders=false",
+        "--log=error",
+        "--limit-results=500",
+        "--limit-references=1000"
+    ],
+    "files.exclude": {
+        ".vscode/.cache": true,
+        ".xmake": true,
+        "vsxmake*": true,
+        ".vs": true,
+        ".idea": true,
+    },
+    "C_Cpp.codeAnalysis.runAutomatically": false,
+    "C_Cpp.intelliSenseEngine": "Disabled",
+    "C_Cpp.formatting": "Disabled",
+    "C_Cpp.autoAddFileAssociations": false,
+    "C_Cpp.autocompleteAddParentheses": false,
+    "C_Cpp.autocomplete": "Disabled",
+    "C_Cpp.errorSquiggles": "Disabled",
+    "xmake.debugConfigType": "codelldb",
+}

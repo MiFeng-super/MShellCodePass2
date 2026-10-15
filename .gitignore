@@ -1,0 +1,15 @@
+build/
+.xmake/
+.vscode/.cache/
+.vscode/compile_commands.json
+
+# Native build outputs
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+*.exe
+

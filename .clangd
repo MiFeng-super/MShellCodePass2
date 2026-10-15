@@ -1,0 +1,35 @@
+CompileFlags:
+  Add: 
+    - -D_M_IX86
+    - -D_HAS_CXX17=1
+    - -D_HAS_CXX20=1
+    - -D_HAS_CXX23=1
+    - /std:c++20
+    - -Wno-microsoft-cast
+    - -Wno-pragma-pack
+    - -Wno-unused-variable
+    - -Wno-deprecated-declarations
+    - -Wno-missing-braces
+    - -Wno-microsoft-string-literal-from-predefined
+    - -Wno-void-pointer-to-int-cast
+    - -ferror-limit=0
+  Remove:
+    - /execution-charset:gb2312
+
+Diagnostics:
+  Suppress:
+    - unused-includes
+    - typecheck_convert_incompatible
+    - typecheck_comparison_of_pointer_integer
+    - redefinition
+    - conflicting_types
+    - unknown_typename
+    - deduction_guide_redeclared
+    - static_assert_failed
+    - typename_nested_not_found
+    - too_few_args_in_macro_invoc
+    - static_assert_requirement_failed
+    - typecheck_nonviable_condition
+    - ovl_no_viable_oper
+    - ovl_no_oper
+    - template_kw_missing
